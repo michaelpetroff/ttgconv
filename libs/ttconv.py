@@ -1,6 +1,6 @@
 import torch
 from torch import nn
-from torch.nn.functional import conv2d
+from torch.nn.functional import conv2d, relu
 from numpy import prod, power
 from string import ascii_lowercase as letters
 from typing import Iterable
@@ -58,7 +58,7 @@ def _hrinchuk_init(core, in_c_modes, ranks, kernel_size):
 
 class TTConvEinsum(nn.Module):
     def __init__(self, in_c_modes, out_c_modes, kernel_size, ranks,
-                 stride=1, padding=0, init=None):
+                 stride=1, padding=0, init=None, mask=None):
         super().__init__()
 
         self.in_c_modes = list(in_c_modes)
@@ -67,9 +67,10 @@ class TTConvEinsum(nn.Module):
         self.kernel_size = kernel_size
         self.stride = stride
         self.padding = padding
+        self.init = init
 
-        if init is None:
-            init = lambda core: _hrinchuk_init(
+        if self.init is None:
+            self.init = lambda core: _hrinchuk_init(
                 core, in_c_modes, self.ranks, self.kernel_size)
 
         if not isinstance(ranks, Iterable):
@@ -96,7 +97,10 @@ class TTConvEinsum(nn.Module):
         self.core0 = nn.Parameter(
             torch.empty(self.ranks[0], 1, self.kernel_size, self.kernel_size)
         )
-        init(self.core0)
+        self.init(self.core0)
+        if mask is not None:
+            with torch.no_grad():
+                self.core0 *= mask
         
         self.cores = []
         for i in range(self.d):
@@ -106,7 +110,7 @@ class TTConvEinsum(nn.Module):
                                 self.ranks[i], self.ranks[i+1])
                 )
             )
-            init(self.cores[-1])
+            self.init(self.cores[-1])
         self.cores = nn.ParameterList(self.cores)
     
     def _apply_convolution(self, X: torch.Tensor):
@@ -156,9 +160,9 @@ class TTConvEinsum(nn.Module):
 
 class TTConvEinsumContract(TTConvEinsum):
     def __init__(self, in_c_modes, out_c_modes, kernel_size, ranks=None,
-                 stride=1, padding=0, batch_size=128, input_size=32, init=None):
+                 stride=1, padding=0, batch_size=128, input_size=32, init=None, mask=None):
         super().__init__(in_c_modes, out_c_modes, kernel_size, ranks,
-                         stride, padding, init)
+                         stride, padding, init, mask)
         self.batch_size = batch_size
         self.input_size = input_size
         self.after_conv_size = int((input_size + 2 * padding - kernel_size) / stride + 1)
@@ -192,17 +196,20 @@ class TTConvEinsumContract(TTConvEinsum):
 
 class TTConvGaussian(TTConvEinsumContract):
     def __init__(self, in_c_modes, out_c_modes, kernel_size, ranks=None,
-                 stride=1, padding=0, batch_size=128, input_size=32, init=None, sigma=0.3):
+                 stride=1, padding=0, batch_size=128, input_size=32,
+                 init=None, mask=None, sigma=0.3, sigma_lower_bound=0.0):
         super().__init__(in_c_modes, out_c_modes, kernel_size, ranks,
-                         stride, padding, batch_size, input_size, init)
+                         stride, padding, batch_size, input_size, init, mask)
 
-        self.sigma = nn.Parameter(torch.tensor(sigma))
+        self.sigma_lower_bound = sigma_lower_bound
+        self.sigma = nn.Parameter(torch.tensor(max(0, sigma - sigma_lower_bound)))
 
     def _apply_convolution(self, X: torch.Tensor):
+        std = self.sigma_lower_bound + relu(self.sigma)
         grid = torch.arange(-self.kernel_size//2+1, self.kernel_size//2+1) ** 2
         grid = grid.to(self.sigma.device)
-        power = -(grid.unsqueeze(0) + grid.unsqueeze(1)) / (2 * self.sigma ** 2)
-        mask = torch.exp(power) / (2 * torch.pi * self.sigma)
+        power = -(grid.unsqueeze(0) + grid.unsqueeze(1)) / (2 * std ** 2)
+        mask = torch.exp(power) / (2 * torch.pi * std)
 
         h, w = X.shape[-2:]
         tmp = X.reshape((-1, 1, h, w)) # (batch_size * in_c, 1, h, w)
@@ -210,4 +217,17 @@ class TTConvGaussian(TTConvEinsumContract):
         tmp = conv2d(tmp, mask * self.core0, stride=self.stride, padding=self.padding)
 
         return tmp
- 
+    
+    def obtain_mask(self):
+        std = self.sigma_lower_bound + relu(self.sigma)
+        grid = torch.arange(-self.kernel_size//2+1, self.kernel_size//2+1) ** 2
+        grid = grid.to(std.device)
+        power = -(grid.unsqueeze(0) + grid.unsqueeze(1)) / (2 * std ** 2)
+        mask = torch.exp(power) / (2 * torch.pi * std)
+        
+        sz = torch.count_nonzero(mask[self.kernel_size//2] > 0.001)
+        lb = int((self.kernel_size-sz)/2)
+        rb = int((self.kernel_size+sz)/2)
+        result = mask[lb:rb, lb:rb]
+
+        return sz.item(), result
