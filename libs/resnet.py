@@ -40,11 +40,6 @@ from typing import Iterable
 from ttconv import TTConvEinsumContract, TTConvGaussian
 
 
-def _weights_init(m):
-    if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
-        init.kaiming_normal_(m.weight)
-
-
 class LambdaLayer(nn.Module):
     def __init__(self, lambd):
         super(LambdaLayer, self).__init__()
@@ -57,19 +52,33 @@ class LambdaLayer(nn.Module):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_planes, planes, kernel_size=3, stride=1, option="A", **kwargs):
+    def __init__(self, in_planes, planes, kernel_size=3, stride=1, option="A",
+                 masks=[None, None], filters=[None, None], **kwargs):
         super(BasicBlock, self).__init__()
-        self.conv1 = BasicBlock._create_conv_layer(in_planes, planes, kernel_size, stride, **kwargs)
+        if not isinstance(kernel_size, Iterable):
+            kernel_size = [kernel_size] * 2
+        self.conv1 = BasicBlock._create_conv_layer(in_planes, planes, kernel_size[0], stride, masks[0], filters[0], **kwargs)
         self.bn1 = BasicBlock._create_bn_layer(planes)
-        self.conv2 = BasicBlock._create_conv_layer(planes, planes, kernel_size, 1, **kwargs)
+        self.conv2 = BasicBlock._create_conv_layer(planes, planes, kernel_size[1], 1, masks[1], filters[1], **kwargs)
         self.bn2 = BasicBlock._create_bn_layer(planes)
         self.shortcut = BasicBlock._create_shortcut_layer(in_planes, planes, stride, option)
     
     @classmethod
-    def _create_conv_layer(cls, in_planes, planes, kernel_size, stride, **kwargs):
-        return nn.Conv2d(
+    def _create_conv_layer(cls, in_planes, planes, kernel_size, stride, mask=None, filter=None, **kwargs):
+        conv = nn.Conv2d(
             in_planes, planes, kernel_size=kernel_size, stride=stride, padding=kernel_size//2, bias=False
         )
+
+        if filter is not None:
+            conv.weight = nn.Parameter(filter)
+        else:
+            init.kaiming_normal_(conv.weight)
+
+        if mask is not None:
+            with torch.no_grad():
+                conv.weight *= mask
+
+        return conv
     
     @classmethod
     def _create_bn_layer(cls, planes):
@@ -85,7 +94,7 @@ class BasicBlock(nn.Module):
                 """
                 res = LambdaLayer(
                     lambda x: F.pad(
-                        x[:, :, ::2, ::2],
+                        x[:, :, ::stride, ::stride],
                         (0, 0, 0, 0, planes // 4, planes // 4),
                         "constant",
                         0,
@@ -113,16 +122,19 @@ class BasicBlock(nn.Module):
 
 
 class BasicBlock_TT(BasicBlock):
-    def __init__(self, in_planes, planes, kernel_size=3, stride=1, option="A", **kwargs):
+    def __init__(self, in_planes, planes, kernel_size=3, stride=1, option="A",
+                 masks=[None, None], filters=[None, None], **kwargs):
         super(BasicBlock, self).__init__()
-        self.conv1 = BasicBlock_TT._create_conv_layer(in_planes, planes, kernel_size, stride, **kwargs)
+        
+        self.conv1 = BasicBlock_TT._create_conv_layer(in_planes, planes, kernel_size[0], stride, masks[0], filters[0], **kwargs)
         self.bn1 = BasicBlock_TT._create_bn_layer(prod(planes))
-        self.conv2 = BasicBlock_TT._create_conv_layer(planes, planes, kernel_size, 1, **kwargs)
+        self.conv2 = BasicBlock_TT._create_conv_layer(planes, planes, kernel_size[1], 1, masks[1], filters[1], **kwargs)
         self.bn2 = BasicBlock_TT._create_bn_layer(prod(planes))
         self.shortcut = BasicBlock_TT._create_shortcut_layer(prod(in_planes), prod(planes), stride, option)
     
     @classmethod
-    def _create_conv_layer(cls, in_c_modes, out_c_modes, kernel_size, stride, gaussian=False, **kwargs):
+    def _create_conv_layer(cls, in_c_modes, out_c_modes, kernel_size, stride,
+                           mask=None, filter=None, gaussian=False, **kwargs):
         conv_func = TTConvGaussian if gaussian else TTConvEinsumContract
         return conv_func(
             in_c_modes, out_c_modes, kernel_size=kernel_size,
@@ -132,36 +144,65 @@ class BasicBlock_TT(BasicBlock):
 
 class ResNet(nn.Module):
     def __init__(self, in_channels, block, num_blocks, inner_modes=[16, 32, 64],
-                 kernel_size=3, num_classes=10, ranks=None, **kwargs):
+                 kernel_size=3, num_classes=10, ranks=None, masks=None, filters=None, **kwargs):
         super(ResNet, self).__init__()
         self.cur_inner_dim = inner_modes[0]
         self.cur_inner_prod = self._update_prod()
+        self.num_blocks = num_blocks
 
         self.conv1 = nn.Conv2d(
-            in_channels, self.cur_inner_prod, kernel_size=kernel_size, stride=1, padding=1, bias=False
+            in_channels, self.cur_inner_prod, kernel_size=3, stride=1, padding=1, bias=False
         )
+        init.kaiming_normal_(self.conv1.weight)
         self.bn1 = nn.BatchNorm2d(self.cur_inner_prod)
 
         if not isinstance(ranks, Iterable):
             ranks = [ranks] * 3
-        self.layer1 = self._make_layer(block, inner_modes[0], num_blocks[0], ranks[0], kernel_size, stride=1, **kwargs)
-        self.layer2 = self._make_layer(block, inner_modes[1], num_blocks[1], ranks[1], kernel_size, stride=2, **kwargs)
-        self.layer3 = self._make_layer(block, inner_modes[2], num_blocks[2], ranks[2], kernel_size, stride=2, **kwargs)
-        self.linear = nn.Linear(self.cur_inner_prod, num_classes)
+            
+        if not isinstance(kernel_size, Iterable):
+            kernel_size = [[[kernel_size] * 2] * n for n in num_blocks]
+        elif not isinstance(kernel_size[0], Iterable):
+            kernel_size = [[kernel_size] * n for n in num_blocks]
+        elif not isinstance(kernel_size[0][0], Iterable):
+            kernel_size = [kernel_size] * 3
+        
+        if not isinstance(masks, Iterable):
+            masks = [[[masks] * 2] * n for n in num_blocks]
+        elif not isinstance(masks[0], Iterable):
+            masks = [[masks] * n for n in num_blocks]
+        elif not isinstance(masks[0][0], Iterable):
+            masks = [masks] * 3
+        
+        if not isinstance(filters, Iterable):
+            filters = [[[filters] * 2] * n for n in num_blocks]
+        elif not isinstance(filters[0], Iterable):
+            filters = [[filters] * n for n in num_blocks]
+        elif not isinstance(filters[0][0], Iterable):
+            filters = [filters] * 3
 
-        self.apply(_weights_init)
+        # Now all strides are 1, be careful
+        self.layer1 = self._make_layer(block, inner_modes[0], num_blocks[0], ranks[0], kernel_size[0],
+                                       stride=1, masks=masks[0], filters=filters[0], **kwargs)
+        self.layer2 = self._make_layer(block, inner_modes[1], num_blocks[1], ranks[1], kernel_size[1],
+                                       stride=1, masks=masks[1], filters=filters[1], **kwargs)
+        self.layer3 = self._make_layer(block, inner_modes[2], num_blocks[2], ranks[2], kernel_size[2],
+                                       stride=1, masks=masks[2], filters=filters[2], **kwargs)
+        self.linear = nn.Linear(self.cur_inner_prod, num_classes)
+        init.kaiming_normal_(self.linear.weight)
     
     def _update_prod(self):
         return prod(self.cur_inner_dim) if isinstance(self.cur_inner_dim, Iterable) else self.cur_inner_dim
 
-    def _make_layer(self, block, c, num_blocks, ranks, kernel_size, stride, **kwargs):
+    def _make_layer(self, block, c, num_blocks, ranks, kernel_sizes, stride, masks, filters, **kwargs):
         strides = [stride] + [1] * (num_blocks - 1)
         layers = []
-        for stride in strides:
+        for i in range(num_blocks):
             if block is BasicBlock:
-                new_layer = block(self.cur_inner_prod, prod(c), kernel_size=kernel_size, stride=stride)
+                new_layer = block(self.cur_inner_prod, prod(c), kernel_size=kernel_sizes[i],
+                                  stride=strides[i], masks=masks[i], filters=filters[i], **kwargs)
             elif block is BasicBlock_TT:
-                new_layer = block(self.cur_inner_dim, c, kernel_size=kernel_size, stride=stride, ranks=ranks, **kwargs)
+                new_layer = block(self.cur_inner_dim, c, kernel_size=kernel_sizes[i],
+                                  stride=strides[i], masks=masks[i], filters=filters[i], ranks=ranks, **kwargs)
             else:
                 raise ValueError('Unknown block')
             
@@ -180,21 +221,56 @@ class ResNet(nn.Module):
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
+    
+    def obtain_masks(self):
+        sizes, masks = [], []
+        for i in range(3):
+            sizes.append([])
+            masks.append([])
+            for j in range(self.num_blocks[i]):
+                sizes[-1].append([])
+                masks[-1].append([])
+                for c in range(1, 3):
+                    layer = self.get_submodule(f'layer{i+1}.{j}.conv{c}')
+                    sz, mask = layer.obtain_mask()
+                    sizes[-1][-1].append(sz)
+                    masks[-1][-1].append(mask)
+        return sizes, masks
+    
+    def obtain_filters(self):
+        sizes, filters = [], []
+        for i in range(3):
+            sizes.append([])
+            filters.append([])
+            for j in range(self.num_blocks[i]):
+                sizes[-1].append([])
+                filters[-1].append([])
+                for c in range(1, 3):
+                    layer = self.get_submodule(f'layer{i+1}.{j}.conv{c}')
+
+                    sz, mask = layer.obtain_mask()
+                    filter = layer._precompute_filter()
+                    lb, rb = int((filter.shape[-1]-sz)/2), int((filter.shape[-1]+sz)/2)
+                    filter = filter[:, :, lb:rb, lb:rb] * mask
+
+                    sizes[-1][-1].append(sz)
+                    filters[-1][-1].append(filter)
+        return sizes, filters
 
 
-def Img_CIFARResNet(num_blocks, tt, **kwargs):
+def Img_CIFARResNet(num_blocks, tt=False, **kwargs):
     block = BasicBlock_TT if tt else BasicBlock
     inner_modes = [(2, 4, 2), (2, 4, 4), (4, 4, 4)] if tt else [16, 32, 64]
     
     return ResNet(3, block, [num_blocks] * 3, inner_modes=inner_modes, **kwargs)
 
 
-def Img_CIFARResNet20(**kwargs): return Img_CIFARResNet(3, tt=False, **kwargs)
-def Img_CIFARResNet32(**kwargs): return Img_CIFARResNet(5, tt=False, **kwargs)
-def Img_CIFARResNet44(**kwargs): return Img_CIFARResNet(7, tt=False, **kwargs)
-def Img_CIFARResNet56(**kwargs): return Img_CIFARResNet(9, tt=False, **kwargs)
-def Img_CIFARResNet110(**kwargs): return Img_CIFARResNet(18, tt=False, **kwargs)
-def Img_CIFARResNet1202(**kwargs): return Img_CIFARResNet(200, tt=False, **kwargs)
+def Img_CIFARResNet20(**kwargs): return Img_CIFARResNet(3, **kwargs)
+def Img_CIFARResNet32(**kwargs): return Img_CIFARResNet(5, **kwargs)
+def Img_CIFARResNet44(**kwargs): return Img_CIFARResNet(7, **kwargs)
+def Img_CIFARResNet56(**kwargs): return Img_CIFARResNet(9, **kwargs)
+def Img_CIFARResNet110(**kwargs): return Img_CIFARResNet(18, **kwargs)
+def Img_CIFARResNet1202(**kwargs): return Img_CIFARResNet(200, **kwargs)
 
 def Img_CIFARResNet20_TT(**kwargs): return Img_CIFARResNet(3, tt=True, **kwargs)
 def Img_CIFARResNet32_TT(**kwargs): return Img_CIFARResNet(5, tt=True, **kwargs)
